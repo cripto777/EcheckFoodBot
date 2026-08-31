@@ -1,16 +1,24 @@
 import os
 import re
 import json
-import base64
 import logging
+import io
+import numpy as np
+from PIL import Image, ImageFilter, ImageEnhance
+
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import aiohttp
 from dotenv import load_dotenv
+
+# Инициализация EasyOCR (загружается один раз при старте, gpu=False для совместимости с хостингом)
+import easyocr
+logging.getLogger("easyocr").setLevel(logging.WARNING) # Скрываем спам от easyocr
+reader = easyocr.Reader(['ru', 'en'], gpu=False)
 
 load_dotenv()
 
@@ -38,7 +46,42 @@ E_DB = load_e_database()
 class AnalysisState(StatesGroup):
     waiting_for_photo = State()
 
+def preprocess_image(image_bytes: bytes) -> bytes:
+    """Предобработка изображения для максимального качества OCR"""
+    image = Image.open(io.BytesIO(image_bytes)).convert('L') # 1. Черно-белый режим
+    
+    # 2. Увеличение размера, если разрешение маленькое (модели любят >1000px по ширине)
+    if image.width < 1000:
+        scale_factor = 1000 / image.width
+        new_size = (int(image.width * scale_factor), int(image.height * scale_factor))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    
+    # 3. Увеличение резкости
+    image = image.filter(ImageFilter.SHARPEN)
+    
+    # 4. Повышение контрастности (коэффициент 2.0 делает текст четче на фоне)
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2.0)
+    
+    # Сохраняем обратно в байты
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format='PNG')
+    return img_byte_arr.getvalue()
+
+def extract_text_from_image(image_bytes: bytes) -> str:
+    """Распознает текст с помощью EasyOCR"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        img_array = np.array(image)
+        # detail=0 возвращает только список строк текста без координат и уверенности
+        result = reader.readtext(img_array, detail=0, paragraph=True) 
+        return " ".join(result)
+    except Exception as e:
+        logging.error(f"Ошибка OCR: {e}")
+        return ""
+
 def find_e_additives_in_text(text: str) -> list:
+    """Ищет E-добавки в распознанном тексте"""
     matches = re.findall(r'\b[eе]\s?(\d{3,4})\b', text, re.IGNORECASE)
     found = []
     for match in matches:
@@ -49,16 +92,19 @@ def find_e_additives_in_text(text: str) -> list:
             found.append({"code": e_code, "info": {"name": "Неизвестная добавка", "danger": "Неизвестно", "description": "Отсутствует в локальной базе."}})
     return found
 
-async def analyze_with_openrouter(image_bytes: bytes, local_db_report: str, extracted_text: str) -> str:
-    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+async def analyze_text_with_openrouter(ocr_text: str, local_db_report: str) -> str:
+    """Отправляет ТОЛЬКО ТЕКСТ в Gemini для анализа (дешевле и быстрее)"""
     
     system_prompt = """Ты — эксперт по безопасности пищевых продуктов. 
-    Проанализируй состав продукта. 
-    1. Учитывай извлеченный текст ингредиентов.
-    2. ОБЯЗАТЕЛЬНО учти предварительный отчет из локальной базы (он уже содержит проверенные опасные E-добавки).
-    3. Если есть другие опасные компоненты (не только E), укажи их.
-    4. Дай структурированный вывод на русском:
-       - ⚠️ **Найденные опасные/подозрительные добавки** (сделай акцент на данных из локальной базы)
+    Тебе передан текст, распознанный с фото этикетки. В нем может быть маркетинговый шум.
+    
+    ТВОИ ЗАДАЧИ:
+    1. Найди в тексте блок, начинающийся со слов "Состав", "Ингредиенты" или подобный. Анализируй ТОЛЬКО его. Игнорируй рекламу, штрих-коды и адреса.
+    2. Внимательно изучи "Отчет локальной базы". Если там есть предупреждения, ОБЯЗАТЕЛЬНО выдели их в начале ответа.
+    3. Найди другие потенциально опасные компоненты (сахар, трансжиры, аллергены), даже если у них нет индекса "Е".
+    4. Дай структурированный вывод на русском языке:
+       - ⚠️ **Найденные опасные/подозрительные добавки** (с акцентом на данные из локальной базы)
+       - ℹ️ **Другие компоненты, требующие внимания** (если есть)
        - ✅ **Общий вердикт безопасности** (Безопасно / С осторожностью / Опасно)
     
     В КОНЦЕ всегда добавляй этот дисклеймер:
@@ -79,10 +125,7 @@ async def analyze_with_openrouter(image_bytes: bytes, local_db_report: str, extr
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": f"Текст с этикетки: {extracted_text}\n\nОтчет локальной базы:\n{local_db_report}"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                ]
+                "content": f"РАСПОЗНАННЫЙ ТЕКСТ С ЭТИКЕТКИ:\n{ocr_text}\n\nОТЧЕТ ЛОКАЛЬНОЙ БАЗЫ:\n{local_db_report}"
             }
         ],
         "max_tokens": 800
@@ -94,7 +137,8 @@ async def analyze_with_openrouter(image_bytes: bytes, local_db_report: str, extr
                 result = await response.json()
                 return result["choices"][0]["message"]["content"]
             else:
-                logging.error(f"Ошибка OpenRouter: {response.status}")
+                error_text = await response.text()
+                logging.error(f"Ошибка OpenRouter: {response.status} - {error_text}")
                 return "❌ Произошла ошибка при анализе через ИИ. Попробуйте позже."
 
 def get_main_menu_keyboard():
@@ -109,8 +153,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     welcome_text = (
         "👋 Привет! Я **EcheckFoodBot** — твой помощник по безопасности продуктов.\n\n"
         "📸 Отправь мне фотографию этикетки с составом, и я:\n"
-        "1️⃣ Мгновенно проверю E-добавки по собственной базе данных.\n"
-        "2️⃣ Использую ИИ для глубокого анализа всего состава.\n\n"
+        "1️⃣ Улучшу качество фото и извлеку из него текст.\n"
+        "2️⃣ Мгновенно проверю E-добавки по собственной базе данных.\n"
+        "3️⃣ Использую ИИ для глубокого анализа ТОЛЬКО списка ингредиентов.\n\n"
         "🔒 *Конфиденциальность:* Мы не собираем и не передаем ваши личные данные третьим лицам, кроме как для обработки запроса через защищенный API ИИ. Вы можете удалить свои данные, просто перестав использовать бота.\n\n"
         "Нажмите кнопку ниже, чтобы начать!"
     )
@@ -119,7 +164,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @router.callback_query(F.data == "new_check")
 async def start_check(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AnalysisState.waiting_for_photo)
-    await callback.message.edit_text("📸 Отправьте фотографию этикетки с составом продукта.\n\n💡 *Совет:* Убедитесь, что текст хорошо освещен и читаем.")
+    await callback.message.edit_text("📸 Отправьте фотографию этикетки с составом продукта.\n\n💡 *Совет:* Старайтесь, чтобы текст был ровным и хорошо освещенным.")
     await callback.answer()
 
 @router.callback_query(F.data == "info")
@@ -128,58 +173,37 @@ async def show_info(callback: types.CallbackQuery):
         "ℹ️ **О боте EcheckFoodBot**\n\n"
         "Бот анализирует состав продуктов питания, выявляя потенциально опасные пищевые добавки (индексы «Е») и их производные.\n\n"
         "⚠️ **Дисклеймер:** Бот не является медицинской службой. Вся информация носит исключительно ознакомительный характер. Бот не учитывает индивидуальные особенности здоровья (аллергии, хронические заболевания), если они не указаны явно. Перед кардинальными изменениями в рационе обязательно проконсультируйтесь с врачом.\n\n"
-        "🔒 **Политика конфиденциальности:** Мы не собираем и не храним ваши персональные данные. Изображения обрабатываются в реальном времени и не сохраняются на наших серверах. Данные передаются в API ИИ только для генерации ответа."
+        "🔒 **Политика конфиденциальности:** Мы не собираем и не храним ваши персональные данные. Изображения обрабатываются в оперативной памяти в реальном времени и не сохраняются на наших серверах."
     )
     await callback.message.edit_text(info_text, reply_markup=get_main_menu_keyboard())
     await callback.answer()
 
 @router.message(AnalysisState.waiting_for_photo, F.photo)
 async def process_photo(message: types.Message, state: FSMContext):
-    status_msg = await message.answer("🔍 Анализирую состав... Сначала проверяю локальную базу, затем подключаю ИИ.")
+    status_msg = await message.answer("🔍 Получаю фото... Улучшаю качество и распознаю текст (это может занять 5-10 секунд).")
     
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     
+    # Скачиваем исходное фото
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}") as resp:
-            image_bytes = await resp.read()
+            original_image_bytes = await resp.read()
 
-    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+    await status_msg.edit_text("⚙️ Обрабатываю изображение и извлекаю текст...")
     
-    # ШАГ 1: Распознавание текста (OCR)
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/cripto777/EcheckFoodBot",
-        "X-Title": "EcheckFoodBot"
-    }
+    # ШАГ 1: Предобработка изображения (Ч/Б, резкость, контраст, ресайз)
+    processed_image_bytes = preprocess_image(original_image_bytes)
     
-    payload_ocr = {
-        "model": "google/gemini-flash-1.5",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Извлеки ВЕСЬ видимый текст ингредиентов с этого фото. Верни только чистый текст, без комментариев."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                ]
-            }
-        ],
-        "max_tokens": 500
-    }
+    # ШАГ 2: OCR распознавание текста
+    extracted_text = extract_text_from_image(processed_image_bytes)
     
-    extracted_text = ""
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://openrouter.ai/api/v1/chat/completions", json=payload_ocr, headers=headers) as resp:
-            if resp.status == 200:
-                res = await resp.json()
-                extracted_text = res["choices"][0]["message"]["content"]
-            else:
-                await status_msg.edit_text("❌ Не удалось распознать текст на фото. Попробуйте сделать фото четче.", reply_markup=get_main_menu_keyboard())
-                await state.clear()
-                return
+    if not extracted_text or len(extracted_text) < 10:
+        await status_msg.edit_text("❌ Не удалось распознать текст на фото. Попробуйте сделать фото четче, ровнее и при лучшем освещении.", reply_markup=get_main_menu_keyboard())
+        await state.clear()
+        return
 
-    # ШАГ 2: Проверка по локальной базе (0 затрат API)
+    # ШАГ 3: Проверка по локальной базе (мгновенно, 0 затрат API)
     found_additives = find_e_additives_in_text(extracted_text)
     
     if found_additives:
@@ -187,12 +211,13 @@ async def process_photo(message: types.Message, state: FSMContext):
         for item in found_additives:
             local_report += f"• **{item['code']}** ({item['info']['name']}): Опасность - {item['info']['danger']}. {item['info']['description']}\n"
     else:
-        local_report = "✅ По локальной базе явных опасных E-добавок не найдено. Передаю полный состав на глубокий анализ ИИ."
+        local_report = "✅ По локальной базе явных опасных E-добавок не найдено. Передаю текст на глубокий анализ ИИ."
 
-    # ШАГ 3: Глубокий анализ через ИИ
-    final_analysis = await analyze_with_openrouter(image_bytes, local_report, extracted_text)
+    # ШАГ 4: Глубокий анализ через ИИ (отправляем ТОЛЬКО текст, без картинки)
+    await status_msg.edit_text("🧠 Анализирую состав с помощью ИИ...")
+    final_analysis = await analyze_text_with_openrouter(extracted_text, local_report)
     
-    response_text = f"📋 **Распознанный текст (фрагмент):**\n_{extracted_text[:300]}..._\n\n{final_analysis}"
+    response_text = f"📋 **Распознанный текст (фрагмент):**\n_{extracted_text[:250]}..._\n\n{final_analysis}"
     
     await status_msg.edit_text(response_text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
     await state.clear()
@@ -209,6 +234,7 @@ async def admin_quantity(message: types.Message):
 
 async def main():
     print("🤖 Бот EcheckFoodBot запущен...")
+    print("⏳ Загрузка моделей EasyOCR (может занять минуту при первом запуске)...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
